@@ -1,36 +1,26 @@
+import { Client } from 'https://deno.land/x/postgres/mod.ts';
+import { v4 } from 'https://deno.land/std/uuid/mod.ts';
 import { EnergyLevel } from '../defs/energy-level.model.ts';
 import { Response } from '../defs/response.model.ts';
-import { getRandomEnergyLevel } from './utils/get-random-energy-value.ts';
-import { getDateFromToday } from './utils/get-date-from-today.ts';
 import { isSameDay } from './utils/is-same-day.ts';
+import { dbCredentials } from '../db-config.ts';
+import { hasDbEntries } from './utils/has-db-entries.ts';
+import { formatDbResponse } from './utils/format-db-response.ts';
 
-const energyLevels: EnergyLevel[] = [
-  { value: 100, date: new Date() },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-1) },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-2) },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-3) },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-4) },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-5) },
-  { value: getRandomEnergyLevel(), date: getDateFromToday(-6) },
-];
+const client = new Client(dbCredentials);
 
-let energyMock: { [userId: string]: EnergyLevel[] } = {
-  miriam: energyLevels,
-  123: energyLevels,
-};
-
-// @route api/v1/energy:id
+// @route api/v1/energy/:user
 // @request GET energy by user
 
-export const getEnergy = ({
+export const getEnergy = async ({
   params,
   response,
 }: {
-  params: { id: string };
+  params: { user: string };
   response: any;
 }) => {
   let result: Response<EnergyLevel[]>;
-  if (!params.id) {
+  if (!params.user) {
     result = {
       result: [],
       success: false,
@@ -38,18 +28,84 @@ export const getEnergy = ({
     };
     response.status = 400;
   } else {
-    const energy = energyMock[params.id];
+    try {
+      await client.connect();
 
-    result = {
-      result: energy || [],
-      success: true,
-    };
-    response.status = 200;
+      const dbEntriesForUser = await client.query(
+        `SELECT * from energylevels where username = $1`,
+        params.user
+      );
+
+      if (!hasDbEntries(dbEntriesForUser)) {
+        setNoResultFound(response);
+        return;
+      }
+
+      const formattedResult = formatDbResponse<EnergyLevel>(dbEntriesForUser);
+      result = {
+        result: formattedResult,
+        success: true,
+      };
+      response.body = result;
+      response.status = 200;
+    } catch (err) {
+      setErrorResponse(response, err);
+    } finally {
+      client.end();
+    }
   }
-  response.body = result;
 };
 
-// @route api/v1/energy:id
+// @route api/v1/energy/:user/:id
+// @request Get energy by id
+
+export const getEnergyById = async ({
+  params,
+  response,
+}: {
+  params: { user: string; id: string };
+  response: any;
+}) => {
+  if (!params.user) {
+    setUsernameNotProvidedResponse(response);
+    return;
+  }
+  if (!params.id) {
+    setIdNotProvidedResponse(response);
+    return;
+  }
+
+  try {
+    await client.connect();
+
+    const dbEntriesForUserAndId = await client.query(
+      `SELECT * from energylevels where username = $1 and id = $2`,
+      params.user,
+      params.id
+    );
+
+    if (!hasDbEntries(dbEntriesForUserAndId)) {
+      setNoResultFound(response);
+      return;
+    }
+
+    const formattedResult = formatDbResponse(dbEntriesForUserAndId);
+
+    const result = {
+      result: formattedResult,
+      success: true,
+    };
+
+    response.body = result;
+    response.status = 200;
+  } catch (err) {
+    setErrorResponse(response, err);
+  } finally {
+    await client.end();
+  }
+};
+
+// @route api/v1/energy:user
 // @request Update energy
 
 export const patchEnergy = async ({
@@ -58,50 +114,161 @@ export const patchEnergy = async ({
   response,
 }: {
   request: any;
-  params: { id: string };
+  params: { user: string };
   response: any;
 }) => {
-  let result: Response<boolean>;
-  if (!params.id) {
+  let result: Response<EnergyLevel[] | undefined>;
+
+  if (!params.user) {
     result = {
-      result: false,
       success: false,
-      invalidProperties: 'No user provided',
+      invalidProperties: 'No user (id) provided',
     };
+    response.body = result;
     response.status = 400;
   } else {
     const body = await request.body();
 
     if (!request.hasBody) {
-      result = {
-        result: false,
-        success: false,
-        invalidProperties: 'No energy data provided',
-      };
-      response.status = 400;
+      setNoDataProvided(response);
       return;
     }
 
-    if (!energyMock[params.id]) {
-      energyMock = { ...energyMock, [params.id]: [body] };
-    } else {
-      energyMock = {
-        ...energyMock,
-        [params.id]: [
-          ...energyMock[params.id].filter(
-            (entry) => !isSameDay(entry.date, body?.value?.date)
-          ),
-          { value: Number(body?.value?.value), date: body?.value?.date },
-        ],
-      };
+    try {
+      await client.connect();
+      const energy: EnergyLevel = body.value;
+      const user = params.user;
+
+      const dbEntriesForUser = await client.query(
+        `SELECT * from energylevels where username = $1`,
+        params.user
+      );
+
+      if (!hasDbEntries(dbEntriesForUser)) {
+        const id = v4.generate();
+        await client.query(
+          'INSERT INTO energylevels(id,value,date,username) VALUES($1, $2, $3, $4)',
+          id,
+          energy.value,
+          energy.date,
+          user
+        );
+
+        const updateEnergyFromDb = await client.query(
+          'SELECT * from energylevels WHERE id = $1 AND username = $2',
+          id,
+          params.user
+        );
+
+        result = {
+          result: formatDbResponse<EnergyLevel>(updateEnergyFromDb),
+          success: true,
+        };
+
+        response.status = 201;
+        response.body = result;
+      } else {
+        const formattedResult = formatDbResponse<EnergyLevel>(dbEntriesForUser);
+        const entryToUpdate = formattedResult.find((entry) =>
+          isSameDay(entry.date, energy.date)
+        );
+
+        if (!entryToUpdate) {
+          const id = v4.generate()
+          await client.query(
+            'INSERT INTO energylevels(id,value,date,username) VALUES($1, $2, $3, $4)',
+            id,
+            energy.value,
+            energy.date,
+            user
+          );
+
+          const updateEnergyFromDb = await client.query(
+            'SELECT * from energylevels WHERE id = $1 AND username = $2',
+            id,
+            params.user
+          );
+  
+          result = {
+            result: formatDbResponse<EnergyLevel>(updateEnergyFromDb),
+            success: true,
+          };
+  
+          response.status = 201;
+          response.body = result;
+
+          return;
+        }
+
+        await client.query(
+          'UPDATE energylevels SET value=$1, date=$2, username=$3 WHERE id=$4',
+          energy.value,
+          energy.date,
+          params.user,
+          entryToUpdate.id
+        );
+
+        result = {
+          result: [entryToUpdate],
+          success: true,
+        };
+
+        response.status = 200;
+        response.body = result;
+      }
+    } catch (err) {
+      setErrorResponse(response, err);
+    } finally {
+      await client.end();
     }
-
-    result = {
-      result: true,
-      success: true,
-    };
-
-    response.status = 200;
-    response.body = result;
   }
 };
+
+function setErrorResponse(response: any, err: Error) {
+  response.status = 500;
+  response.body = {
+    success: false,
+    error: true,
+    message: err && err.toString(),
+  };
+}
+
+function setUsernameNotProvidedResponse(response: any) {
+  const result = {
+    result: [],
+    success: false,
+    invalidProperties: 'No user provided',
+  };
+  response.body = result;
+  response.status = 400;
+}
+
+function setIdNotProvidedResponse(response: any) {
+  const result = {
+    result: [],
+    success: false,
+    invalidProperties: 'No id provided',
+  };
+  response.body = result;
+  response.status = 400;
+}
+
+function setNoDataProvided(response: any) {
+  const result = {
+    success: false,
+    invalidProperties: 'No energy data provided',
+  };
+  response.body = result;
+  response.status = 400;
+}
+
+function setNoResultFound(response: any) {
+  const result = {
+    result: [],
+    success: false,
+  };
+  response.body = result;
+  response.status = 404;
+}
+
+

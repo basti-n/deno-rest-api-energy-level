@@ -1,5 +1,5 @@
 export interface Response<T> {
-    result: T,
+    result?: T,
     success: boolean;
     invalidProperties?: string;
     message?: string;

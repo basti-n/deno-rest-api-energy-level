@@ -1,7 +1,7 @@
 import { Application } from 'https://deno.land/x/oak/mod.ts';
-import routes from './routes.ts'
+import routes from './routes.ts';
 
-const port = 5000;
+const port = Number(Deno.env.get('PORT')) || 5000;
 
 const app = new Application();
 
